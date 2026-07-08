@@ -462,11 +462,57 @@ def run_agent(user_request: str, verbose: bool = True) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# API-Key-Bootstrap (für Doppelklick-Start ohne Terminal-Befehle)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_KEY_FILE = Path(__file__).resolve().parent / ".api_key"
+
+
+def ensure_api_key() -> bool:
+    """Stellt sicher, dass ANTHROPIC_API_KEY gesetzt ist.
+
+    Reihenfolge: Umgebungsvariable -> lokale Datei .api_key -> interaktive
+    Abfrage (wird dann in .api_key gespeichert, damit man es nur einmal machen
+    muss). Der Key steht NICHT im Code und wird nicht committet (.gitignore).
+    """
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    if _KEY_FILE.exists():
+        key = _KEY_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            os.environ["ANTHROPIC_API_KEY"] = key
+            return True
+    print("Kein API-Key gefunden.")
+    print("Einen Key bekommst du kostenlos unter https://console.anthropic.com/")
+    print("(Settings → API Keys). Er beginnt mit 'sk-ant-'.\n")
+    try:
+        key = input("API-Key hier einfügen und Enter drücken: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if not key:
+        return False
+    os.environ["ANTHROPIC_API_KEY"] = key
+    try:
+        _KEY_FILE.write_text(key, encoding="utf-8")
+        try:
+            os.chmod(_KEY_FILE, 0o600)  # nur für dich lesbar (POSIX)
+        except OSError:
+            pass
+        print(f"\nKey gespeichert in {_KEY_FILE.name} — beim nächsten Mal geht's direkt los.\n")
+    except OSError as exc:
+        print(f"\nKonnte Key nicht speichern ({exc}); gilt nur für diese Sitzung.\n")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Terminal-Einstieg
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print(f"Autonomer Recherche-Agent ({MODEL}) — Text-Modus.")
+    if not ensure_api_key():
+        print("Ohne API-Key kann der Agent nicht starten. Beende.")
+        return
     print("Arbeitsordner:", WORK_DIR)
     print("Leere Eingabe oder 'exit' beendet.\n")
     while True:

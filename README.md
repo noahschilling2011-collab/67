@@ -14,23 +14,40 @@ Zwei strikt getrennte Phasen:
 
 ---
 
-## API-Key setzen (nicht im Code!)
+## Einfach starten (Doppelklick, kein Terminal nötig)
+
+Passenden Starter doppelklicken:
+
+| System   | Datei                          | Hinweis |
+|----------|--------------------------------|---------|
+| Windows  | `Agent-starten-Windows.bat`    | Doppelklick. Falls Windows warnt: „Weitere Informationen“ → „Trotzdem ausführen“. |
+| macOS    | `Agent-starten-Mac.command`    | Erstes Mal: **Rechtsklick → Öffnen** (wegen Gatekeeper). |
+| Linux    | `Agent-starten-Linux.sh`       | Doppelklick → „Ausführen“, oder im Terminal `./Agent-starten-Linux.sh`. |
+
+Voraussetzung: **Python 3** ist installiert
+([python.org/downloads](https://www.python.org/downloads/) — bei Windows im
+Setup „Add Python to PATH“ anhaken). Der Starter installiert das benötigte Paket
+selbst.
+
+**Beim ersten Start** fragt der Agent einmal nach deinem **API-Key** (Eingabe,
+Enter). Der Key wird lokal in `.api_key` gespeichert — danach startet es direkt.
+Einen Key gibt es unter <https://console.anthropic.com/> → Settings → API Keys
+(beginnt mit `sk-ant-`). Der Key steht nie im Code und wird nicht mit-committet.
+
+> **Fable 5 braucht 30-Tage-Datenaufbewahrung.** Bei Zero-Data-Retention-Orgs
+> schlägt jede Fable-5-Anfrage mit HTTP 400 fehl — dann in `agent.py`
+> `MODEL = "claude-opus-4-8"` setzen.
+
+<details>
+<summary>Alternative: klassisch über das Terminal</summary>
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."      # Linux / macOS
 setx  ANTHROPIC_API_KEY "sk-ant-..."       # Windows (danach neues Terminal)
-```
-
-> **Fable 5 braucht 30-Tage-Datenaufbewahrung.** Bei Organisationen mit
-> Zero-Data-Retention schlägt jede Fable-5-Anfrage mit HTTP 400 fehl — dann in
-> `agent.py` `MODEL = "claude-opus-4-8"` setzen.
-
-## Phase 1 starten
-
-```bash
 pip install anthropic
 python agent.py
 ```
+</details>
 
 ---
 

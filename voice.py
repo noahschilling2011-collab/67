@@ -34,7 +34,7 @@ from __future__ import annotations
 import speech_recognition as sr
 import pyttsx3
 
-from agent import run_agent  # <- der unveränderte Agent-Kern aus Phase 1
+from agent import run_agent, ensure_api_key  # <- der unveränderte Agent-Kern aus Phase 1
 
 # STT-Sprache/Region. "de-DE" für Deutsch, "en-US" für Englisch.
 STT_LANGUAGE = "de-DE"
@@ -96,6 +96,10 @@ def listen(recognizer: sr.Recognizer, mic: sr.Microphone) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if not ensure_api_key():
+        print("Ohne API-Key kann der Agent nicht starten.")
+        return
+
     recognizer = sr.Recognizer()
     try:
         mic = sr.Microphone()
