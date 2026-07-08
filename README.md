@@ -1,15 +1,16 @@
-# Autonomer Tool-Agent
+# Autonomer Recherche-Agent
 
 Ein Agent, der eine Anfrage bekommt, **selbst entscheidet welche Tools er in
-welcher Reihenfolge aufruft**, und autonom bis zum Ergebnis arbeitet.
-Reasoning-Loop über die Anthropic Messages API.
+welcher Reihenfolge aufruft**, und autonom bis zum Ergebnis arbeitet — ausgelegt
+darauf, sich **viel Information** zu beschaffen: Websuche liefert Quell-URLs,
+`fetch_url` lädt ganze Seiten, mehrere Quellen werden abgeglichen. Läuft auf
+**Claude Fable 5** (1M-Kontext) und hält damit große Mengen Recherche im Kopf.
 
 Zwei strikt getrennte Phasen:
 
 - **Phase 1 — `agent.py`**: Agent-Kern, Text rein / Text raus, Terminal.
-  Läuft komplett eigenständig.
-- **Phase 2 — `voice.py`**: Voice-Wrapper. Ruft nur `run_agent()` aus `agent.py`
-  auf und ändert den Kern **nicht**.
+- **Phase 2 — `voice.py`**: Voice-Wrapper. Ruft nur `run_agent()` auf und ändert
+  den Kern **nicht**.
 
 ---
 
@@ -20,6 +21,10 @@ export ANTHROPIC_API_KEY="sk-ant-..."      # Linux / macOS
 setx  ANTHROPIC_API_KEY "sk-ant-..."       # Windows (danach neues Terminal)
 ```
 
+> **Fable 5 braucht 30-Tage-Datenaufbewahrung.** Bei Organisationen mit
+> Zero-Data-Retention schlägt jede Fable-5-Anfrage mit HTTP 400 fehl — dann in
+> `agent.py` `MODEL = "claude-opus-4-8"` setzen.
+
 ## Phase 1 starten
 
 ```bash
@@ -27,69 +32,77 @@ pip install anthropic
 python agent.py
 ```
 
-Beispiel-Session:
-
-```
-Du > Suche, welches das aktuelle Claude-Modell von Anthropic ist,
-     und schreibe eine kurze Zusammenfassung in modell.txt.
-```
-
 ---
 
-## Die 3 Tools
+## Die Tools (4)
 
-| Tool          | Was es tut                                              | Sicherheit |
-|---------------|---------------------------------------------------------|------------|
-| `web_search`  | Websuche via DuckDuckGo (schlüssellos). Kein Netz/kein Treffer → **klar markierter Stub**, kein Crash. | read-only, extern |
-| `file`        | `read` / `write` einer Textdatei **im Arbeitsordner**   | Pfad hart auf Arbeitsordner begrenzt, 1 MB Limit |
-| `list_files`  | Listet den Arbeitsordner auf                            | read-only |
+| Tool          | Was es tut                                                        | Sicherheit |
+|---------------|-------------------------------------------------------------------|------------|
+| `web_search`  | Websuche via DuckDuckGo (schlüssellos), liefert Treffer **mit URL**. Kein Netz/kein Treffer → klar markierter Stub. | read-only, extern |
+| `fetch_url`   | Lädt eine **ganze Webseite** und gibt den Text zurück (bis 40 000 Zeichen/Seite). Damit liest der Agent volle Artikel statt nur Snippets. | **SSRF-Schutz**: nur öffentliche http/https |
+| `file`        | `read` / `write` einer Textdatei **im Arbeitsordner** (bis 2 MB)  | Pfad hart auf Arbeitsordner begrenzt |
+| `list_files`  | Listet den Arbeitsordner auf                                      | read-only |
 
-Der Arbeitsordner ist standardmäßig `./agent_workspace` (überschreibbar per
-`AGENT_WORKDIR`). Er wird beim Start automatisch angelegt.
+Der typische Recherche-Fluss: `web_search` (Quellen + URLs finden) →
+`fetch_url` (die besten Seiten im Detail lesen, mehrfach) → ggf. `file` (viel
+Material zwischenspeichern) → Antwort mit Quellen. Bis zu **15 Iterationen** und
+`effort: high` geben dem Agenten Raum, viele Quellen abzuklappern.
+
+Arbeitsordner: standardmäßig `./agent_workspace` (per `AGENT_WORKDIR`
+überschreibbar), wird beim Start angelegt.
 
 ---
 
 ## Guardrails (im Code verankert, nicht nur im Prompt)
 
-1. **Keine Dateien außerhalb des Arbeitsordners.** Jeder Pfad wird über
-   `_safe_path()` aufgelöst und geprüft; `../`-Traversal, absolute Pfade und
-   aus dem Ordner zeigende Symlinks werden mit `GuardrailError` abgelehnt.
-2. **Keine Systembefehle / kein Shell / kein beliebiger Code.** Es gibt schlicht
-   kein Tool dafür — der Agent kann nur die drei definierten Funktionen aufrufen.
-3. **Größenlimit** von 1 MB pro Lese-/Schreibvorgang.
-4. **Hartes Iterationslimit** von 8 Runden (`MAX_ITERATIONS`), danach sauberer
-   Abbruch mit Meldung.
-5. **Kein Crash bei Tool-Fehlern.** Jeder Tool-Aufruf ist gekapselt; Fehler und
-   leere Ergebnisse gehen als `is_error`-Tool-Result zurück an das Modell, das
-   dann einen anderen Weg wählen kann.
+1. **Keine Dateien außerhalb des Arbeitsordners** — `_safe_path()` lehnt `../`,
+   absolute Pfade und ausbrechende Symlinks ab.
+2. **Kein SSRF** — `fetch_url` erlaubt nur öffentliche http/https-Hosts;
+   `localhost`, `127.*`, private Netze (`10.*`, `192.168.*`, `172.16–31.*`),
+   Link-Local/Cloud-Metadaten (`169.254.169.254`) und andere Schemata
+   (`file://`, `ftp://`) werden geblockt — alle aufgelösten IPs werden geprüft.
+3. **Größenlimits** — 2 MB pro Datei, 3 MB Download, 40 000 Zeichen/Seite ans Modell.
+4. **Keine Systembefehle / kein Shell / kein beliebiger Code** — es gibt kein Tool dafür.
+5. **Hartes Iterationslimit** von 15 Runden, danach sauberer Abbruch.
+6. **Kein Crash bei Tool-Fehlern** — jeder Fehler geht als `is_error` zurück ans
+   Modell, das dann einen anderen Weg wählen kann.
+
+Zusätzlich: bei einer **Sicherheits-Ablehnung** durch Fable 5 übernimmt
+automatisch das Fallback-Modell `claude-opus-4-8` (server-side fallback).
 
 ---
 
 ## Testfall (braucht ≥ 2 Tools nacheinander)
 
 **Anfrage:**
-> „Suche nach dem aktuellen Anthropic-Claude-Modell und schreibe eine
-> 2-Satz-Zusammenfassung nach `modell.txt`. Liste danach den Ordner auf.“
+> „Recherchiere, welche Modelle zur Claude-5-Familie gehören. Öffne mindestens
+> zwei Quellen im Detail, schreibe eine Zusammenfassung mit Quellenangaben nach
+> `claude5.md` und liste danach den Ordner auf.“
 
 **Erwarteter Ablauf:**
 
 ```
 ── Iteration 1 ──
-  → Tool: web_search   Input: {"query": "aktuelles Anthropic Claude Modell"}
-    ✓ [Websuche] Treffer: ...
+  → Tool: web_search   Input: {"query": "Claude 5 Familie Modelle Anthropic"}
+    ✓ [Websuche] Treffer (URLs mit fetch_url öffnen): 1. ... <https://...>
 ── Iteration 2 ──
-  → Tool: file         Input: {"action": "write", "path": "modell.txt", "content": "..."}
-    ✓ [Datei] N Zeichen geschrieben nach modell.txt
+  → Tool: fetch_url    Input: {"url": "https://..."}
+    ✓ [Fetch] https://...  <voller Seitentext>
 ── Iteration 3 ──
-  → Tool: list_files   Input: {}
-    ✓ [Liste] FILE modell.txt (N B)
+  → Tool: fetch_url    Input: {"url": "https://..."}   (zweite Quelle)
+    ✓ [Fetch] ...
 ── Iteration 4 ──
+  → Tool: file         Input: {"action": "write", "path": "claude5.md", ...}
+    ✓ [Datei] N Zeichen geschrieben nach claude5.md
+── Iteration 5 ──
+  → Tool: list_files   Input: {}
+    ✓ [Liste] FILE claude5.md (N B)
+── Iteration 6 ──
   (stop_reason = end_turn)
-Agent > Ich habe ... in modell.txt gespeichert; der Ordner enthält modell.txt.
+Agent > Zusammenfassung … Quellen: … (gespeichert in claude5.md).
 ```
 
-Das Modell ruft `web_search` → `file(write)` → `list_files` **selbst** in dieser
-Reihenfolge auf; die Reihenfolge ist nicht fest verdrahtet.
+Reihenfolge und Anzahl der Aufrufe wählt das Modell **selbst**.
 
 ---
 
@@ -104,35 +117,33 @@ pip install SpeechRecognition pyttsx3
 python voice.py
 ```
 
-- **STT**: `SpeechRecognition` mit `recognize_google` (kostenlos, ohne Key,
+- **STT**: `SpeechRecognition` + `recognize_google` (kostenlos, ohne Key,
   braucht Internet). Offline-Alternative: `pip install openai-whisper`.
-- **TTS**: `pyttsx3` (offline, ohne Key, plattformübergreifend).
-- **Fehl-Erkennung**: Unverständliches/Rauschen (`UnknownValueError`, Timeout,
-  Dienstfehler) wird abgefangen → der Agent wird gar nicht erst aufgerufen,
-  stattdessen „Bitte wiederhole das“. Nach 3 Fehlversuchen Ende. Zusätzlich ein
+- **TTS**: `pyttsx3` (offline, ohne Key).
+- **Fehl-Erkennung**: Unverständliches/Rauschen wird abgefangen → der Agent
+  wird gar nicht erst aufgerufen. Nach 3 Fehlversuchen Ende. Zusätzlich ein
   **Bestätigungs-Gate**: die verstandene Anfrage wird zurückgesprochen und muss
-  mit „ja“ bestätigt werden, bevor der Agent (und damit Dateien/Tools) reagiert.
+  mit „ja“ bestätigt werden, bevor der Agent reagiert.
 
-Der Voice-Layer importiert `run_agent` und ruft es unverändert auf — der
-Agent-Kern weiß nichts von Sprache.
+Der Voice-Layer importiert `run_agent` und ruft es unverändert auf.
 
 ---
 
 ## Die 2 Stellen, an denen der Agent in der Praxis am ehesten bricht
 
-1. **Websuche liefert Stub statt echter Antwort.**
-   Die DuckDuckGo-Instant-Answer-API gibt für viele Anfragen nichts
-   Strukturiertes zurück. Dann kommt ein `[Websuche – STUB]`-Text — der Agent
-   arbeitet weiter, aber mit dünner Faktenlage, und schreibt evtl. eine
-   inhaltlich schwache Zusammenfassung.
-   *Woran du es merkst:* In der Terminal-Ausgabe steht `[Websuche – STUB]` oder
-   `Suche nicht verfügbar`. **Fix:** in `tool_web_search()` einen echten
-   Such-Dienst mit Key eintragen (Brave, Tavily, SerpAPI).
+1. **Websuche liefert Stub statt echter Treffer.**
+   Die schlüssellose DuckDuckGo-API gibt für viele Anfragen nichts
+   Strukturiertes zurück — dann fehlen dem Agenten die URLs zum Nachladen, und
+   `fetch_url` läuft ins Leere.
+   *Woran du es merkst:* `[Websuche – STUB]` in der Ausgabe. **Fix:** in
+   `tool_web_search()` einen echten Such-Dienst mit Key eintragen (Brave,
+   Tavily, SerpAPI) — dann bekommt der Agent verlässlich viele Quell-URLs.
 
-2. **Aufgabe passt nicht in 8 Iterationen.**
-   Bei vage/mehrteilig formulierten Anfragen kann das Modell Tools „im Kreis“
-   aufrufen und ins Iterationslimit laufen.
-   *Woran du es merkst:* Die Antwort ist
-   `[Abbruch] Iterationslimit (8) erreicht ...`. **Fix:** Anfrage konkreter
-   stellen/aufteilen, oder `MAX_ITERATIONS` in `agent.py` erhöhen (Achtung:
-   höhere Kosten und Latenz pro Anfrage).
+2. **Viel Recherche → Iterationslimit oder große Kontextmenge.**
+   Bei breiten Anfragen ruft Fable 5 gern viele `fetch_url` hintereinander auf.
+   Das kann ins 15er-Limit laufen ODER (bei sehr vielen großen Seiten) Kosten/
+   Latenz stark erhöhen.
+   *Woran du es merkst:* `[Abbruch] Iterationslimit (15) erreicht …`, oder
+   spürbar langsame/teure Läufe. **Fix:** `MAX_ITERATIONS`, `MAX_FETCH_CHARS`
+   und `MAX_SEARCH_RESULTS` in `agent.py` an dein Budget anpassen; Anfragen
+   fokussierter stellen.

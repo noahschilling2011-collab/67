@@ -1,11 +1,19 @@
 """
-Phase 1 — Autonomer Tool-Agent (Text rein / Text raus, Terminal).
+Phase 1 — Autonomer Recherche-Agent (Text rein / Text raus, Terminal).
 
 Ein Agent, der eine Anfrage bekommt, selbst entscheidet welche Tools er in
-welcher Reihenfolge aufruft, und autonom bis zum Ergebnis arbeitet.
+welcher Reihenfolge aufruft, und autonom bis zum Ergebnis arbeitet. Ausgelegt
+darauf, sich VIEL Information zu beschaffen: Websuche liefert Quell-URLs,
+fetch_url lädt ganze Seiten, mehrere Quellen werden abgeglichen; Fable 5 hält
+das alles in seinem 1M-Kontext.
 
 Reasoning-Loop: Anthropic Messages API (manuelle Kontrollschleife, damit das
 harte Iterationslimit und die Guardrails vollständig im Code liegen).
+
+Modell: claude-fable-5 (Anthropics leistungsfähigstes Modell). Bei einer
+sicherheitsbedingten Ablehnung übernimmt automatisch ein Fallback-Modell
+(server-side fallback). Fable 5 setzt 30-Tage-Datenaufbewahrung voraus — bei
+Zero-Data-Retention-Orgs schlägt JEDE Anfrage mit 400 fehl.
 
 KEIN API-Key im Code. Setze ihn als Umgebungsvariable:
     export ANTHROPIC_API_KEY="sk-ant-..."      # Linux / macOS
@@ -18,8 +26,12 @@ Start:
 
 from __future__ import annotations
 
+import html
+import ipaddress
 import json
 import os
+import re
+import socket
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -30,10 +42,17 @@ import anthropic
 # Konfiguration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL = "claude-opus-4-8"        # aktuelles Opus-Modell
-MAX_TOKENS = 4096
-MAX_ITERATIONS = 8               # HARTES LIMIT — danach sauberer Abbruch
-MAX_FILE_BYTES = 1_000_000       # 1 MB Lese-/Schreib-Obergrenze pro Datei
+MODEL = "claude-fable-5"          # leistungsfähigstes Modell, 1M Kontext
+FALLBACK_MODEL = "claude-opus-4-8"  # springt bei Sicherheits-Ablehnung ein
+EFFORT = "high"                    # gründliche Recherche (low|medium|high|xhigh|max)
+
+MAX_TOKENS = 8192                  # Antwort-/Turn-Budget (nicht-gestreamt, < ~16k)
+MAX_ITERATIONS = 15               # HARTES LIMIT — Raum für Multi-Quellen-Recherche
+
+MAX_FILE_BYTES = 2_000_000        # 2 MB Lese-/Schreib-Obergrenze pro Datei
+MAX_FETCH_BYTES = 3_000_000       # max. Download-Größe einer Seite (roh)
+MAX_FETCH_CHARS = 40_000          # max. an das Modell zurückgegebener Text/Seite
+MAX_SEARCH_RESULTS = 10           # Treffer pro Websuche
 
 # Arbeitsordner: alles läuft ausschließlich hier drin. Wird beim Start angelegt.
 WORK_DIR = Path(os.environ.get("AGENT_WORKDIR", "./agent_workspace")).resolve()
@@ -46,16 +65,15 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 #
 # Was der Agent NIE tut (im Code verankert, nicht nur im System-Prompt):
 #   1. Dateien außerhalb von WORK_DIR lesen/schreiben  -> _safe_path()
-#      Blockiert absolute Ausbrüche, "../"-Traversal und Symlinks, die
-#      aus dem Arbeitsordner herauszeigen.
-#   2. Dateien über MAX_FILE_BYTES lesen/schreiben     -> Größen-Check
-#   3. Systembefehle / Shell / beliebiger Python-Code   -> es gibt schlicht
-#      kein Tool dafür. Der Agent kann nur die unten definierten Funktionen
-#      aufrufen; alles andere ist nicht erreichbar.
-#   4. Mehr als MAX_ITERATIONS Runden                   -> Kontrollschleife
+#   2. Dateien / Downloads über die Größenlimits        -> Byte-Checks
+#   3. Interne/lokale Adressen abrufen (SSRF)           -> _assert_public_url()
+#      fetch_url darf NUR öffentliche http/https-Hosts laden — keine
+#      localhost/127.*, keine privaten Netze, kein Cloud-Metadaten-Endpunkt.
+#   4. Systembefehle / Shell / beliebiger Python-Code   -> es gibt kein Tool dafür
+#   5. Mehr als MAX_ITERATIONS Runden                   -> Kontrollschleife
 #
 # Sicherheitsgrenze: Tool-Eingaben sind Modell-Output und damit nicht
-# vertrauenswürdig. Jede Datei-Operation wird deshalb hart validiert.
+# vertrauenswürdig. Jede Datei- und Netz-Operation wird deshalb hart validiert.
 
 
 class GuardrailError(Exception):
@@ -67,9 +85,7 @@ def _safe_path(raw_path: str) -> Path:
     stellt sicher, dass er WORK_DIR nicht verlässt. Sonst GuardrailError."""
     if not raw_path or not isinstance(raw_path, str):
         raise GuardrailError("Leerer oder ungültiger Pfad.")
-
     candidate = (WORK_DIR / raw_path).resolve()
-    # is_relative_to gibt es ab Python 3.9. Prüft, ob candidate in WORK_DIR liegt.
     if candidate != WORK_DIR and WORK_DIR not in candidate.parents:
         raise GuardrailError(
             f"Zugriff verweigert: '{raw_path}' liegt außerhalb des Arbeitsordners."
@@ -77,14 +93,36 @@ def _safe_path(raw_path: str) -> Path:
     return candidate
 
 
+def _assert_public_url(url: str) -> str:
+    """Erlaubt nur öffentliche http/https-URLs. Blockiert SSRF: localhost,
+    Loopback, private/reservierte/Link-Local-Netze (inkl. Cloud-Metadaten
+    169.254.169.254). Prüft ALLE aufgelösten IP-Adressen des Hosts."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise GuardrailError(f"Nur http/https erlaubt, nicht '{parsed.scheme}'.")
+    host = parsed.hostname
+    if not host:
+        raise GuardrailError("URL ohne Host.")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise GuardrailError(f"Host nicht auflösbar: {host} ({exc}).")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise GuardrailError(f"Zugriff auf interne/reservierte Adresse verweigert: {ip}.")
+    return url
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 1 — Websuche
+# Tool 1 — Websuche (liefert Text + URLs zum Nachladen)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Nutzt die schlüssellose DuckDuckGo Instant-Answer-API. Wenn kein Netz da ist
-# oder die API nichts liefert, gibt es ein KLAR MARKIERTES Stub-Ergebnis zurück
-# (kein Crash). Für eine echte Volltextsuche hier eine API mit Key eintragen
-# (z. B. Brave Search, Tavily, SerpAPI) — Rückgabe bleibt ein String.
+# Schlüssellose DuckDuckGo Instant-Answer-API. Gibt Treffer MIT URL zurück,
+# damit der Agent anschließend fetch_url auf die spannendsten Quellen anwenden
+# kann. Kein Netz/kein Treffer -> klar markierter Stub, kein Crash. Für echte
+# Volltextsuche hier einen Dienst mit Key eintragen (Brave, Tavily, SerpAPI).
 
 def tool_web_search(query: str) -> str:
     query = (query or "").strip()
@@ -99,27 +137,34 @@ def tool_web_search(query: str) -> str:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
 
-        parts: list[str] = []
+        results: list[str] = []
         if data.get("AbstractText"):
-            src = data.get("AbstractSource", "")
-            parts.append(f"{data['AbstractText']} (Quelle: {src})")
+            src = data.get("AbstractURL", "")
+            results.append(f"{data['AbstractText']}  <{src}>")
 
-        for topic in data.get("RelatedTopics", []):
-            text = topic.get("Text") if isinstance(topic, dict) else None
-            if text:
-                parts.append(text)
-            if len(parts) >= 5:
-                break
+        def walk(topics: list) -> None:
+            for t in topics:
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    return
+                if not isinstance(t, dict):
+                    continue
+                if "Topics" in t:            # verschachtelte Kategorie
+                    walk(t["Topics"])
+                elif t.get("Text"):
+                    url = t.get("FirstURL", "")
+                    results.append(f"{t['Text']}  <{url}>")
 
-        if parts:
-            return "[Websuche] Treffer:\n- " + "\n- ".join(parts[:5])
+        walk(data.get("RelatedTopics", []))
 
-        # API erreichbar, aber ohne verwertbares Ergebnis -> klarer Stub.
+        if results:
+            lines = [f"{i}. {r}" for i, r in enumerate(results[:MAX_SEARCH_RESULTS], 1)]
+            return ("[Websuche] Treffer (URLs mit fetch_url öffnen):\n" + "\n".join(lines))
+
         return (
             f"[Websuche – STUB] Keine strukturierte Antwort für '{query}'. "
             "Für echte Suche einen API-Key-Dienst in tool_web_search() eintragen."
         )
-    except Exception as exc:  # Netz weg, Timeout, JSON kaputt ...
+    except Exception as exc:
         return (
             f"[Websuche – STUB] Suche nicht verfügbar ({type(exc).__name__}): {exc}. "
             f"Angefragt war: '{query}'."
@@ -127,7 +172,47 @@ def tool_web_search(query: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 2 — Datei lesen / schreiben (im Arbeitsordner)
+# Tool 2 — Ganze Webseite laden und als Text zurückgeben
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Das ist der Schlüssel zu "viele Informationen": statt nur Suchsnippets kann
+# der Agent vollständige Artikel/Dokus lesen. HTML wird grob zu Text gestrippt.
+
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+_SCRIPT_RE = re.compile(r"(?is)<(script|style|noscript)\b.*?</\1>")
+
+
+def tool_fetch_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return "[Fetch] Leere URL."
+    _assert_public_url(url)  # Guardrail: kein SSRF
+
+    req = urllib.request.Request(url, headers={"User-Agent": "tool-agent/1.0"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        raw = resp.read(MAX_FETCH_BYTES + 1)
+        ctype = resp.headers.get("Content-Type", "")
+
+    if len(raw) > MAX_FETCH_BYTES:
+        raw = raw[:MAX_FETCH_BYTES]
+    body = raw.decode("utf-8", errors="replace")
+
+    # Bei HTML: Skripte/Styles entfernen, Tags strippen, Entities dekodieren.
+    if "html" in ctype.lower() or body.lstrip()[:1] == "<":
+        body = _SCRIPT_RE.sub(" ", body)
+        body = _TAG_RE.sub(" ", body)
+        body = html.unescape(body)
+    text = re.sub(r"\s+", " ", body).strip()
+
+    if not text:
+        return f"[Fetch] {url} lieferte keinen lesbaren Text."
+    if len(text) > MAX_FETCH_CHARS:
+        text = text[:MAX_FETCH_CHARS] + f"\n…[gekürzt, {MAX_FETCH_CHARS} Zeichen]"
+    return f"[Fetch] {url}\n{text}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool 3 — Datei lesen / schreiben (im Arbeitsordner)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tool_file(action: str, path: str, content: str | None = None) -> str:
@@ -153,12 +238,8 @@ def tool_file(action: str, path: str, content: str | None = None) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool 3 — Dateien im Arbeitsordner auflisten
+# Tool 4 — Dateien im Arbeitsordner auflisten
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Passt zum Ziel (Datei-Recherche/-Zusammenfassung): der Agent kann sehen,
-# was schon da ist, bevor er liest oder schreibt. Read-only, kann nichts kaputt
-# machen — und lässt sich im Testfall gut als dritter Schritt einhängen.
 
 def tool_list_files(subdir: str = "") -> str:
     base = _safe_path(subdir) if subdir else WORK_DIR
@@ -183,9 +264,9 @@ TOOLS_SCHEMA = [
     {
         "name": "web_search",
         "description": (
-            "Sucht im Web nach aktuellen Informationen. Nutze dies, wenn die "
-            "Antwort von aktuellem Wissen abhängt (Ereignisse, Preise, Fakten "
-            "nach deinem Trainingsstand)."
+            "Sucht im Web und liefert Treffer MIT URL. Nutze dies, um Quellen "
+            "und Links zu finden; lies die interessanten Seiten anschließend mit "
+            "fetch_url im Detail."
         ),
         "input_schema": {
             "type": "object",
@@ -196,11 +277,26 @@ TOOLS_SCHEMA = [
         },
     },
     {
+        "name": "fetch_url",
+        "description": (
+            "Lädt eine öffentliche Webseite und gibt ihren Textinhalt zurück. "
+            "Damit liest du vollständige Artikel/Quellen statt nur Snippets. "
+            "Nur http/https, keine internen Adressen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Vollständige http(s)-URL."}
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "file",
         "description": (
             "Liest oder schreibt eine Textdatei im Arbeitsordner. "
             "action='read' liefert den Inhalt; action='write' speichert 'content'. "
-            "Pfade sind relativ zum Arbeitsordner."
+            "Nutze dies, um recherchierte Informationen zu sammeln/zwischenzuspeichern."
         ),
         "input_schema": {
             "type": "object",
@@ -234,6 +330,7 @@ TOOLS_SCHEMA = [
 # Name -> Python-Callable
 TOOL_IMPL = {
     "web_search": lambda i: tool_web_search(i.get("query", "")),
+    "fetch_url": lambda i: tool_fetch_url(i.get("url", "")),
     "file": lambda i: tool_file(i.get("action", ""), i.get("path", ""), i.get("content")),
     "list_files": lambda i: tool_list_files(i.get("subdir", "")),
 }
@@ -265,19 +362,49 @@ def _execute_tool(name: str, tool_input: dict) -> tuple[str, bool]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "Du bist ein autonomer Assistent mit Werkzeugen. Entscheide selbst, welche "
-    "Tools du in welcher Reihenfolge brauchst, und arbeite eigenständig bis zum "
-    "Ergebnis. Alle Dateioperationen laufen in einem festen Arbeitsordner. "
-    "Wenn ein Tool einen Fehler liefert, versuche einen anderen Weg statt "
-    "aufzugeben. Wenn du fertig bist, antworte dem Nutzer direkt in Prosa."
+    "Du bist ein gründlicher, autonomer Recherche-Assistent mit Werkzeugen. "
+    "Beschaffe dir so viel relevante Information wie nötig: nutze web_search, "
+    "um Quellen und URLs zu finden, und fetch_url, um die vielversprechendsten "
+    "Seiten vollständig zu lesen. Ziehe mehrere Quellen heran und gleiche sie ab, "
+    "bevor du antwortest; nenne Quellen. Speichere umfangreiche Zwischenstände "
+    "bei Bedarf mit dem file-Tool im Arbeitsordner. Entscheide selbst über "
+    "Reihenfolge und Anzahl der Tool-Aufrufe. Wenn ein Tool einen Fehler liefert, "
+    "versuche einen anderen Weg statt aufzugeben. Bist du fertig, antworte dem "
+    "Nutzer direkt und klar in Prosa, Ergebnis zuerst."
 )
+
+
+def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
+    """Erzeugt eine Antwort. Für Fable 5 mit Server-Side-Fallback auf ein
+    Ausweichmodell (falls eine Sicherheits-Ablehnung greift). Degradiert
+    robust, falls die SDK-Version die Parameter nicht kennt."""
+    common = dict(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        tools=TOOLS_SCHEMA,
+        messages=messages,
+        output_config={"effort": EFFORT},
+    )
+    try:
+        return client.beta.messages.create(
+            betas=["server-side-fallback-2026-06-01"],
+            fallbacks=[{"model": FALLBACK_MODEL}],
+            **common,
+        )
+    except (TypeError, AttributeError, anthropic.BadRequestError):
+        try:
+            return client.messages.create(**common)          # ohne Fallback
+        except (TypeError, anthropic.BadRequestError):
+            common.pop("output_config", None)                 # ohne effort
+            return client.messages.create(**common)
 
 
 def run_agent(user_request: str, verbose: bool = True) -> str:
     """Führt eine Anfrage autonom aus und gibt die finale Textantwort zurück.
 
-    Das ist die öffentliche Schnittstelle des Agent-Kerns. Der Voice-Layer
-    (Phase 2) ruft ausschließlich diese Funktion auf.
+    Öffentliche Schnittstelle des Agent-Kerns. Der Voice-Layer (Phase 2) ruft
+    ausschließlich diese Funktion auf.
     """
     client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
     messages: list[dict] = [{"role": "user", "content": user_request}]
@@ -287,15 +414,12 @@ def run_agent(user_request: str, verbose: bool = True) -> str:
             print(f"\n── Iteration {iteration}/{MAX_ITERATIONS} ──")
 
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS_SCHEMA,
-                messages=messages,
-            )
+            response = _create_message(client, messages)
         except anthropic.APIError as exc:
             return f"[Abbruch] API-Fehler: {exc}"
+
+        if verbose and getattr(response, "model", MODEL) != MODEL:
+            print(f"  (Fallback-Modell hat geantwortet: {response.model})")
 
         # Sicherheitsablehnung: erst stop_reason prüfen, dann content lesen.
         if response.stop_reason == "refusal":
@@ -315,7 +439,7 @@ def run_agent(user_request: str, verbose: bool = True) -> str:
             if block.type != "tool_use":
                 continue
             if verbose:
-                print(f"  → Tool: {block.name}  Input: {json.dumps(block.input, ensure_ascii=False)}")
+                print(f"  → Tool: {block.name}  Input: {json.dumps(block.input, ensure_ascii=False)[:200]}")
             result_text, is_error = _execute_tool(block.name, block.input)
             if verbose:
                 preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
@@ -342,7 +466,8 @@ def run_agent(user_request: str, verbose: bool = True) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print("Autonomer Tool-Agent — Text-Modus. Arbeitsordner:", WORK_DIR)
+    print(f"Autonomer Recherche-Agent ({MODEL}) — Text-Modus.")
+    print("Arbeitsordner:", WORK_DIR)
     print("Leere Eingabe oder 'exit' beendet.\n")
     while True:
         try:
