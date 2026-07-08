@@ -1,0 +1,8 @@
+# Phase 1 — Agent-Kern
+anthropic>=0.40
+
+# Phase 2 — Voice-Layer (nur nötig, wenn du voice.py nutzt)
+SpeechRecognition>=3.10
+pyttsx3>=2.90
+# Mikrofon-Backend, siehe Kommentar in voice.py (System-Paket portaudio nötig):
+#   pip install pyaudio

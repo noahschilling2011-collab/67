@@ -1,0 +1,8 @@
+# Arbeitsordner des Agenten (Laufzeit-Dateien)
+agent_workspace/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
