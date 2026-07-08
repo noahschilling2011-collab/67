@@ -8,9 +8,12 @@ darauf, sich **viel Information** zu beschaffen: Websuche liefert Quell-URLs,
 
 ## ⭐ Zwei einfache Wege zu starten
 
-**A) Mit Fenster (Eingabefeld, Buttons) — `Agent-Fenster.py`**
-- **Windows:** doppelklicken.
-- **Mac/Linux:** Terminal → `python3 "Agent-Fenster.py"` (Linux ggf. einmalig
+**A) Mit Fenster (Eingabefeld, Buttons)**
+- **Windows:** `Fenster-starten-Windows.vbs` doppelklicken → öffnet das Fenster
+  **ohne schwarzes Konsolenfenster**. (Alternativ direkt `Agent-Fenster.py`.)
+- **Mac:** `Fenster-starten-Mac.command` doppelklicken (erstes Mal Rechtsklick →
+  „Öffnen").
+- **Linux:** Terminal → `python3 "Agent-Fenster.py"` (ggf. einmalig
   `sudo apt install python3-tk`).
 - Braucht `agent.py` im selben Ordner. Key wird im Fenster abgefragt.
 
