@@ -6,16 +6,28 @@ darauf, sich **viel Information** zu beschaffen: Websuche liefert Quell-URLs,
 `fetch_url` lädt ganze Seiten, mehrere Quellen werden abgeglichen. Läuft auf
 **Claude Fable 5** (1M-Kontext) und hält damit große Mengen Recherche im Kopf.
 
-## ⭐ Am einfachsten: eine einzige Datei
+## ⭐ Zwei einfache Wege zu starten
 
-**`Recherche-Agent.py`** enthält alles — den kompletten Agenten, installiert
-das benötigte Paket selbst und fragt beim ersten Start einmal nach dem API-Key.
-Mehr brauchst du nicht:
+**A) Mit Fenster (Eingabefeld, Buttons) — `Agent-Fenster.py`**
+- **Windows:** doppelklicken.
+- **Mac/Linux:** Terminal → `python3 "Agent-Fenster.py"` (Linux ggf. einmalig
+  `sudo apt install python3-tk`).
+- Braucht `agent.py` im selben Ordner. Key wird im Fenster abgefragt.
 
-- **Windows:** `Recherche-Agent.py` doppelklicken (Python muss installiert sein).
-- **Mac/Linux:** Terminal → `python3 "Recherche-Agent.py"`
+**B) Alles in einer Datei (Konsole) — `Recherche-Agent.py`**
+- **Windows:** doppelklicken. **Mac/Linux:** `python3 "Recherche-Agent.py"`.
+- Installiert das benötigte Paket selbst und fragt den Key einmal ab.
 
-Der Rest der Dateien unten ist optional (modulare Variante + Voice + Starter).
+Beide brauchen nur **Python 3** ([python.org/downloads](https://www.python.org/downloads/),
+bei Windows „Add Python to PATH" anhaken) und einen **API-Key** von
+[console.anthropic.com](https://console.anthropic.com/).
+
+### Websuche
+Ohne Konfiguration läuft eine **schlüssellose echte Websuche** (DuckDuckGo).
+Für stärkere/mehr Treffer optional einen Key als Umgebungsvariable setzen —
+`TAVILY_API_KEY` ([tavily.com](https://tavily.com)) oder `BRAVE_API_KEY`
+([brave.com/search/api](https://brave.com/search/api/)); der Agent nutzt ihn
+dann automatisch.
 
 ---
 

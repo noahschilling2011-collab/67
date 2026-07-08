@@ -1,6 +1,15 @@
 # Phase 1 — Agent-Kern
 anthropic>=0.40
 
+# Fenster-Oberfläche (Agent-Fenster.py): tkinter ist Teil von Python.
+#   Windows/macOS: bereits enthalten.
+#   Linux: einmalig  sudo apt install python3-tk
+
+# Optionale stärkere Websuche (kein Muss – ohne Key läuft die schlüssellose
+# DuckDuckGo-Suche). Key als Umgebungsvariable setzen:
+#   TAVILY_API_KEY=...   (https://tavily.com)
+#   BRAVE_API_KEY=...    (https://brave.com/search/api/)
+
 # Phase 2 — Voice-Layer (nur nötig, wenn du voice.py nutzt)
 SpeechRecognition>=3.10
 pyttsx3>=2.90

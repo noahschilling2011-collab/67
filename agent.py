@@ -124,51 +124,103 @@ def _assert_public_url(url: str) -> str:
 # kann. Kein Netz/kein Treffer -> klar markierter Stub, kein Crash. Für echte
 # Volltextsuche hier einen Dienst mit Key eintragen (Brave, Tavily, SerpAPI).
 
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
+
+
+def _strip_html(s: str) -> str:
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def _decode_ddg_link(href: str) -> str:
+    if href.startswith("//"):
+        href = "https:" + href
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+    return params.get("uddg", [href])[0]
+
+
+def _search_ddg_html(query: str, limit: int) -> list[str]:
+    """Schlüssellose echte Websuche über die DuckDuckGo-HTML-Seite."""
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        page = resp.read().decode("utf-8", errors="replace")
+    links = re.findall(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+    snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+    out: list[str] = []
+    for i, (href, title) in enumerate(links[:limit]):
+        snip = _strip_html(snips[i]) if i < len(snips) else ""
+        out.append(f"{_strip_html(title)} — {snip}  <{_decode_ddg_link(href)}>")
+    return out
+
+
+def _search_tavily(query: str, key: str, limit: int) -> list[str]:
+    payload = json.dumps({"api_key": key, "query": query, "max_results": limit}).encode()
+    req = urllib.request.Request("https://api.tavily.com/search", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    return [f"{r.get('title', '')} — {r.get('content', '')}  <{r.get('url', '')}>"
+            for r in data.get("results", [])[:limit]]
+
+
+def _search_brave(query: str, key: str, limit: int) -> list[str]:
+    url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(
+        {"q": query, "count": limit})
+    req = urllib.request.Request(url, headers={"X-Subscription-Token": key, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    return [f"{r.get('title', '')} — {r.get('description', '')}  <{r.get('url', '')}>"
+            for r in data.get("web", {}).get("results", [])[:limit]]
+
+
 def tool_web_search(query: str) -> str:
+    """Echte Websuche. Reihenfolge:
+    1. Tavily / Brave, falls TAVILY_API_KEY bzw. BRAVE_API_KEY gesetzt ist.
+    2. Schlüssellose DuckDuckGo-HTML-Suche (echte Treffer, kein Key nötig).
+    3. DuckDuckGo Instant Answer als letzter Versuch, sonst Stub.
+    """
     query = (query or "").strip()
     if not query:
         return "[Websuche] Leere Suchanfrage."
 
+    def _fmt(res: list[str]) -> str:
+        lines = [f"{i}. {r}" for i, r in enumerate(res[:MAX_SEARCH_RESULTS], 1)]
+        return "[Websuche] Treffer (URLs mit fetch_url öffnen):\n" + "\n".join(lines)
+
+    # 1) Echte Such-API per Umgebungsvariable
+    for env, fn in (("TAVILY_API_KEY", _search_tavily), ("BRAVE_API_KEY", _search_brave)):
+        key = os.environ.get(env)
+        if key:
+            try:
+                res = fn(query, key, MAX_SEARCH_RESULTS)
+                if res:
+                    return _fmt(res)
+            except Exception:
+                pass  # nächste Quelle probieren
+
+    # 2) Schlüssellose echte Suche
+    try:
+        res = _search_ddg_html(query, MAX_SEARCH_RESULTS)
+        if res:
+            return _fmt(res)
+    except Exception:
+        pass
+
+    # 3) Instant Answer / Stub
     try:
         url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode(
-            {"q": query, "format": "json", "no_html": "1", "no_redirect": "1"}
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "tool-agent/1.0"})
+            {"q": query, "format": "json", "no_html": "1", "no_redirect": "1"})
+        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-
-        results: list[str] = []
         if data.get("AbstractText"):
-            src = data.get("AbstractURL", "")
-            results.append(f"{data['AbstractText']}  <{src}>")
-
-        def walk(topics: list) -> None:
-            for t in topics:
-                if len(results) >= MAX_SEARCH_RESULTS:
-                    return
-                if not isinstance(t, dict):
-                    continue
-                if "Topics" in t:            # verschachtelte Kategorie
-                    walk(t["Topics"])
-                elif t.get("Text"):
-                    url = t.get("FirstURL", "")
-                    results.append(f"{t['Text']}  <{url}>")
-
-        walk(data.get("RelatedTopics", []))
-
-        if results:
-            lines = [f"{i}. {r}" for i, r in enumerate(results[:MAX_SEARCH_RESULTS], 1)]
-            return ("[Websuche] Treffer (URLs mit fetch_url öffnen):\n" + "\n".join(lines))
-
-        return (
-            f"[Websuche – STUB] Keine strukturierte Antwort für '{query}'. "
-            "Für echte Suche einen API-Key-Dienst in tool_web_search() eintragen."
-        )
-    except Exception as exc:
-        return (
-            f"[Websuche – STUB] Suche nicht verfügbar ({type(exc).__name__}): {exc}. "
-            f"Angefragt war: '{query}'."
-        )
+            return f"[Websuche] {data['AbstractText']}  <{data.get('AbstractURL', '')}>"
+    except Exception:
+        pass
+    return (f"[Websuche – STUB] Keine Treffer für '{query}'. Für stärkere Suche "
+            "optional TAVILY_API_KEY oder BRAVE_API_KEY setzen.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,26 +452,34 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
             return client.messages.create(**common)
 
 
-def run_agent(user_request: str, verbose: bool = True) -> str:
+def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
     """Führt eine Anfrage autonom aus und gibt die finale Textantwort zurück.
 
-    Öffentliche Schnittstelle des Agent-Kerns. Der Voice-Layer (Phase 2) ruft
-    ausschließlich diese Funktion auf.
+    Öffentliche Schnittstelle des Agent-Kerns. Der Voice-Layer und die
+    Fenster-Oberfläche rufen ausschließlich diese Funktion auf.
+
+    on_step: optionaler Callback(str) für Fortschrittsmeldungen (z. B. GUI).
+             Ist er gesetzt, ersetzt er die verbose-Ausgabe auf der Konsole.
     """
+    def emit(msg: str) -> None:
+        if on_step is not None:
+            on_step(msg)
+        elif verbose:
+            print(msg)
+
     client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
     messages: list[dict] = [{"role": "user", "content": user_request}]
 
     for iteration in range(1, MAX_ITERATIONS + 1):
-        if verbose:
-            print(f"\n── Iteration {iteration}/{MAX_ITERATIONS} ──")
+        emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
 
         try:
             response = _create_message(client, messages)
         except anthropic.APIError as exc:
             return f"[Abbruch] API-Fehler: {exc}"
 
-        if verbose and getattr(response, "model", MODEL) != MODEL:
-            print(f"  (Fallback-Modell hat geantwortet: {response.model})")
+        if getattr(response, "model", MODEL) != MODEL:
+            emit(f"(Fallback-Modell hat geantwortet: {response.model})")
 
         # Sicherheitsablehnung: erst stop_reason prüfen, dann content lesen.
         if response.stop_reason == "refusal":
@@ -438,12 +498,10 @@ def run_agent(user_request: str, verbose: bool = True) -> str:
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            if verbose:
-                print(f"  → Tool: {block.name}  Input: {json.dumps(block.input, ensure_ascii=False)[:200]}")
+            emit(f"→ Tool: {block.name}  {json.dumps(block.input, ensure_ascii=False)[:160]}")
             result_text, is_error = _execute_tool(block.name, block.input)
-            if verbose:
-                preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
-                print(f"    {'✗' if is_error else '✓'} {preview}")
+            preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
+            emit(f"  {'✗' if is_error else '✓'} {preview}")
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
