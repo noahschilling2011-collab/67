@@ -6,6 +6,19 @@ darauf, sich **viel Information** zu beschaffen: Websuche liefert Quell-URLs,
 `fetch_url` lädt ganze Seiten, mehrere Quellen werden abgeglichen. Läuft auf
 **Claude Fable 5** (1M-Kontext) und hält damit große Mengen Recherche im Kopf.
 
+## ⭐ Am einfachsten: eine einzige Datei
+
+**`Recherche-Agent.py`** enthält alles — den kompletten Agenten, installiert
+das benötigte Paket selbst und fragt beim ersten Start einmal nach dem API-Key.
+Mehr brauchst du nicht:
+
+- **Windows:** `Recherche-Agent.py` doppelklicken (Python muss installiert sein).
+- **Mac/Linux:** Terminal → `python3 "Recherche-Agent.py"`
+
+Der Rest der Dateien unten ist optional (modulare Variante + Voice + Starter).
+
+---
+
 Zwei strikt getrennte Phasen:
 
 - **Phase 1 — `agent.py`**: Agent-Kern, Text rein / Text raus, Terminal.
