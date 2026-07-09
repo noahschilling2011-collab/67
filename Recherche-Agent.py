@@ -40,6 +40,7 @@ def _ensure(pkg: str) -> None:
 
 _ensure("anthropic")
 
+import datetime
 import html
 import ipaddress
 import json
@@ -67,6 +68,38 @@ _HERE = Path(__file__).resolve().parent
 WORK_DIR = Path(os.environ.get("AGENT_WORKDIR", _HERE / "agent_workspace")).resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 _KEY_FILE = _HERE / ".api_key"
+CONFIG_FILE = _HERE / ".agent_config.json"
+
+
+def load_config() -> dict:
+    """Lädt .agent_config.json (Such-Keys -> Umgebung, effort -> Modul)."""
+    global EFFORT
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    for name in ("TAVILY_API_KEY", "BRAVE_API_KEY"):
+        val = (cfg.get(name) or "").strip()
+        if val:
+            os.environ[name] = val
+    if cfg.get("effort") in ("low", "medium", "high", "xhigh", "max"):
+        EFFORT = cfg["effort"]
+    return cfg
+
+
+def save_config(values: dict) -> None:
+    cfg = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    cfg.update(values)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+    load_config()
 
 
 # ─── 2) Guardrails ──────────────────────────────────────────────────────────
@@ -322,8 +355,12 @@ SYSTEM_PROMPT = (
 )
 
 
+def _system_prompt() -> str:
+    return SYSTEM_PROMPT + f"\n\nHeutiges Datum: {datetime.date.today().isoformat()}."
+
+
 def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
-    common = dict(model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT,
+    common = dict(model=MODEL, max_tokens=MAX_TOKENS, system=_system_prompt(),
                   tools=TOOLS_SCHEMA, messages=messages,
                   output_config={"effort": EFFORT})
     try:
@@ -338,39 +375,70 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
             return client.messages.create(**common)
 
 
-def run_agent(user_request: str, verbose: bool = True) -> str:
-    client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
-    messages: list[dict] = [{"role": "user", "content": user_request}]
+def _emitter(verbose, on_step):
+    def emit(msg):
+        if on_step is not None:
+            on_step(msg)
+        elif verbose:
+            print(msg)
+    return emit
+
+
+def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
     for iteration in range(1, MAX_ITERATIONS + 1):
-        if verbose:
-            print(f"\n── Iteration {iteration}/{MAX_ITERATIONS} ──")
+        emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
         try:
             response = _create_message(client, messages)
         except anthropic.APIError as exc:
-            return f"[Abbruch] API-Fehler: {exc}"
-        if verbose and getattr(response, "model", MODEL) != MODEL:
-            print(f"  (Fallback-Modell hat geantwortet: {response.model})")
+            return (f"[Abbruch] API-Fehler: {exc}", messages)
+        if getattr(response, "model", MODEL) != MODEL:
+            emit(f"(Fallback-Modell hat geantwortet: {response.model})")
         if response.stop_reason == "refusal":
-            return "[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt."
+            return ("[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.", messages)
         if response.stop_reason != "tool_use":
-            final = "".join(b.text for b in response.content if b.type == "text")
-            return final.strip() or "[Ende] Keine Textantwort erzeugt."
+            final = "".join(b.text for b in response.content if b.type == "text").strip()
+            final = final or "[Ende] Keine Textantwort erzeugt."
+            messages.append({"role": "assistant", "content": final})
+            return (final, messages)
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            if verbose:
-                print(f"  → Tool: {block.name}  Input: {json.dumps(block.input, ensure_ascii=False)[:200]}")
+            emit(f"→ Tool: {block.name}  {json.dumps(block.input, ensure_ascii=False)[:160]}")
             result_text, is_error = _execute_tool(block.name, block.input)
-            if verbose:
-                preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
-                print(f"    {'✗' if is_error else '✓'} {preview}")
+            preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
+            emit(f"  {'✗' if is_error else '✓'} {preview}")
             tool_results.append({"type": "tool_result", "tool_use_id": block.id,
                                  "content": result_text, "is_error": is_error})
         messages.append({"role": "user", "content": tool_results})
     return (f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, ohne die "
-            "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen.")
+            "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen.", messages)
+
+
+def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
+    """Einzelanfrage ohne Gedächtnis."""
+    client = anthropic.Anthropic()
+    answer, _ = _run_loop(client, [{"role": "user", "content": user_request}],
+                          _emitter(verbose, on_step))
+    return answer
+
+
+class Agent:
+    """Fortlaufendes Gespräch MIT Gedächtnis."""
+
+    def __init__(self):
+        self.client = anthropic.Anthropic()
+        self.messages: list[dict] = []
+
+    def ask(self, user_request: str, verbose: bool = True, on_step=None) -> str:
+        self.messages.append({"role": "user", "content": user_request})
+        answer, self.messages = _run_loop(self.client, self.messages,
+                                          _emitter(verbose, on_step))
+        return answer
+
+    def reset(self) -> None:
+        self.messages = []
 
 
 # ─── 6) API-Key-Bootstrap ───────────────────────────────────────────────────
@@ -409,12 +477,15 @@ def main() -> None:
     print("=" * 60)
     print(f"  Autonomer Recherche-Agent  ({MODEL})")
     print("=" * 60)
+    load_config()
     if not ensure_api_key():
         print("Ohne API-Key kann der Agent nicht starten.")
         input("Enter zum Schließen ...")
         return
     print("Arbeitsordner:", WORK_DIR)
-    print("Stell deine Frage. Leere Eingabe oder 'exit' beendet.\n")
+    print("Gesprächsgedächtnis aktiv — Folgefragen bauen aufeinander auf.")
+    print("'neu' startet ein neues Gespräch, leere Eingabe oder 'exit' beendet.\n")
+    agent = Agent()
     while True:
         try:
             request = input("Du > ").strip()
@@ -423,8 +494,12 @@ def main() -> None:
             break
         if not request or request.lower() in {"exit", "quit"}:
             break
+        if request.lower() in {"neu", "reset"}:
+            agent.reset()
+            print("(neues Gespräch gestartet)\n")
+            continue
         try:
-            answer = run_agent(request)
+            answer = agent.ask(request)
         except Exception as exc:  # nichts soll das Fenster hart abstürzen lassen
             answer = f"[Fehler] {type(exc).__name__}: {exc}"
         print("\nAgent >", answer, "\n")

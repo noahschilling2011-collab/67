@@ -9,3 +9,4 @@ venv/
 
 # Lokaler API-Key (nicht committen)
 .api_key
+.agent_config.json

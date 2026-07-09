@@ -25,12 +25,21 @@ Beide brauchen nur **Python 3** ([python.org/downloads](https://www.python.org/d
 bei Windows „Add Python to PATH" anhaken) und einen **API-Key** von
 [console.anthropic.com](https://console.anthropic.com/).
 
-### Websuche
+### Gesprächsgedächtnis
+Der Agent merkt sich den Gesprächsverlauf — **Folgefragen bauen aufeinander
+auf** („und wo wurde er geboren?" versteht, wer gemeint ist). Ein neues Gespräch
+startest du im Fenster über **„Neu (Gespräch)"**, in der Konsole mit `neu`.
+Außerdem kennt der Agent das **heutige Datum** (für „aktuell/neueste").
+
+### Websuche & Einstellungen
 Ohne Konfiguration läuft eine **schlüssellose echte Websuche** (DuckDuckGo).
-Für stärkere/mehr Treffer optional einen Key als Umgebungsvariable setzen —
-`TAVILY_API_KEY` ([tavily.com](https://tavily.com)) oder `BRAVE_API_KEY`
-([brave.com/search/api](https://brave.com/search/api/)); der Agent nutzt ihn
-dann automatisch.
+Für stärkere/mehr Treffer optional einen Such-Key hinterlegen:
+- **Im Fenster:** Button **„Einstellungen"** → Tavily-/Brave-Key eintragen und
+  Gründlichkeit (Effort) wählen. Wird lokal in `.agent_config.json` gespeichert.
+- **Oder** als Umgebungsvariable `TAVILY_API_KEY` ([tavily.com](https://tavily.com))
+  bzw. `BRAVE_API_KEY` ([brave.com/search/api](https://brave.com/search/api/)).
+
+Der Agent nutzt einen gesetzten Key automatisch, sonst die schlüssellose Suche.
 
 ---
 

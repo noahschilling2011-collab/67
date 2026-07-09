@@ -26,6 +26,7 @@ Start:
 
 from __future__ import annotations
 
+import datetime
 import html
 import ipaddress
 import json
@@ -55,8 +56,46 @@ MAX_FETCH_CHARS = 40_000          # max. an das Modell zurückgegebener Text/Sei
 MAX_SEARCH_RESULTS = 10           # Treffer pro Websuche
 
 # Arbeitsordner: alles läuft ausschließlich hier drin. Wird beim Start angelegt.
+_HERE = Path(__file__).resolve().parent
 WORK_DIR = Path(os.environ.get("AGENT_WORKDIR", "./agent_workspace")).resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# Lokale Konfiguration (Suchschlüssel, Effort) — wird nicht committet.
+CONFIG_FILE = _HERE / ".agent_config.json"
+
+
+def load_config() -> dict:
+    """Lädt .agent_config.json und wendet sie an (Such-Keys -> Umgebung,
+    effort -> Modul). Wird beim Start aufgerufen. Fehlt die Datei, passiert
+    nichts."""
+    global EFFORT
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    for name in ("TAVILY_API_KEY", "BRAVE_API_KEY"):
+        val = (cfg.get(name) or "").strip()
+        if val:
+            os.environ[name] = val
+    if cfg.get("effort") in ("low", "medium", "high", "xhigh", "max"):
+        EFFORT = cfg["effort"]
+    return cfg
+
+
+def save_config(values: dict) -> None:
+    """Speichert Such-Keys/Effort in .agent_config.json und wendet sie sofort an."""
+    cfg = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    cfg.update(values)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+    load_config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -421,9 +460,15 @@ SYSTEM_PROMPT = (
     "bevor du antwortest; nenne Quellen. Speichere umfangreiche Zwischenstände "
     "bei Bedarf mit dem file-Tool im Arbeitsordner. Entscheide selbst über "
     "Reihenfolge und Anzahl der Tool-Aufrufe. Wenn ein Tool einen Fehler liefert, "
-    "versuche einen anderen Weg statt aufzugeben. Bist du fertig, antworte dem "
-    "Nutzer direkt und klar in Prosa, Ergebnis zuerst."
+    "versuche einen anderen Weg statt aufzugeben. In einem Gespräch beziehst du "
+    "dich auf vorherige Fragen und Antworten. Bist du fertig, antworte dem Nutzer "
+    "direkt und klar in Prosa, Ergebnis zuerst."
 )
+
+
+def _system_prompt() -> str:
+    """System-Prompt inkl. heutigem Datum (für 'aktuell/neueste')."""
+    return SYSTEM_PROMPT + f"\n\nHeutiges Datum: {datetime.date.today().isoformat()}."
 
 
 def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
@@ -433,7 +478,7 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
     common = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
+        system=_system_prompt(),
         tools=TOOLS_SCHEMA,
         messages=messages,
         output_config={"effort": EFFORT},
@@ -452,48 +497,33 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
             return client.messages.create(**common)
 
 
-def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
-    """Führt eine Anfrage autonom aus und gibt die finale Textantwort zurück.
+def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
+    """Autonome Kontrollschleife über eine bestehende Nachrichten-Historie.
 
-    Öffentliche Schnittstelle des Agent-Kerns. Der Voice-Layer und die
-    Fenster-Oberfläche rufen ausschließlich diese Funktion auf.
-
-    on_step: optionaler Callback(str) für Fortschrittsmeldungen (z. B. GUI).
-             Ist er gesetzt, ersetzt er die verbose-Ausgabe auf der Konsole.
+    Rückgabe: (finale_antwort, aktualisierte_historie). Die Historie enthält
+    danach den vollständigen Verlauf inkl. Tool-Runden und finaler Antwort, sodass
+    Folgefragen daran anknüpfen können.
     """
-    def emit(msg: str) -> None:
-        if on_step is not None:
-            on_step(msg)
-        elif verbose:
-            print(msg)
-
-    client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
-    messages: list[dict] = [{"role": "user", "content": user_request}]
-
     for iteration in range(1, MAX_ITERATIONS + 1):
         emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
-
         try:
             response = _create_message(client, messages)
         except anthropic.APIError as exc:
-            return f"[Abbruch] API-Fehler: {exc}"
+            return (f"[Abbruch] API-Fehler: {exc}", messages)
 
         if getattr(response, "model", MODEL) != MODEL:
             emit(f"(Fallback-Modell hat geantwortet: {response.model})")
 
-        # Sicherheitsablehnung: erst stop_reason prüfen, dann content lesen.
         if response.stop_reason == "refusal":
-            return "[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt."
+            return ("[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.", messages)
 
-        # Modell ist fertig -> finalen Text zurückgeben.
         if response.stop_reason != "tool_use":
-            final = "".join(b.text for b in response.content if b.type == "text")
-            return final.strip() or "[Ende] Keine Textantwort erzeugt."
+            final = "".join(b.text for b in response.content if b.type == "text").strip()
+            final = final or "[Ende] Keine Textantwort erzeugt."
+            messages.append({"role": "assistant", "content": final})
+            return (final, messages)
 
-        # Assistenten-Turn (inkl. tool_use-Blöcke) an die Historie anhängen.
         messages.append({"role": "assistant", "content": response.content})
-
-        # Alle angeforderten Tools ausführen und Ergebnisse sammeln.
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -502,21 +532,54 @@ def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
             result_text, is_error = _execute_tool(block.name, block.input)
             preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
             emit(f"  {'✗' if is_error else '✓'} {preview}")
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result_text,
-                "is_error": is_error,
-            })
-
-        # Alle Tool-Ergebnisse in EINER User-Nachricht zurückgeben.
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id,
+                                 "content": result_text, "is_error": is_error})
         messages.append({"role": "user", "content": tool_results})
 
-    # Iterationslimit erreicht -> sauberer Abbruch, kein Crash.
-    return (
-        f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, ohne die "
-        "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen."
-    )
+    return (f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, ohne die "
+            "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen.",
+            messages)
+
+
+def _emitter(verbose: bool, on_step):
+    def emit(msg: str) -> None:
+        if on_step is not None:
+            on_step(msg)
+        elif verbose:
+            print(msg)
+    return emit
+
+
+def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
+    """Einzelanfrage ohne Gedächtnis (Rückgabe: finale Textantwort).
+
+    Für ein fortlaufendes Gespräch mit Gedächtnis die Klasse Agent nutzen.
+    """
+    client = anthropic.Anthropic()
+    messages = [{"role": "user", "content": user_request}]
+    answer, _ = _run_loop(client, messages, _emitter(verbose, on_step))
+    return answer
+
+
+class Agent:
+    """Fortlaufendes Gespräch MIT Gedächtnis. Jede Frage kennt die vorherigen.
+
+        a = Agent(); a.ask("Wer ist X?"); a.ask("Und wo wurde er geboren?")
+        a.reset()  # neues Gespräch
+    """
+
+    def __init__(self):
+        self.client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
+        self.messages: list[dict] = []
+
+    def ask(self, user_request: str, verbose: bool = True, on_step=None) -> str:
+        self.messages.append({"role": "user", "content": user_request})
+        answer, self.messages = _run_loop(self.client, self.messages,
+                                          _emitter(verbose, on_step))
+        return answer
+
+    def reset(self) -> None:
+        self.messages = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,11 +631,14 @@ def ensure_api_key() -> bool:
 
 def main() -> None:
     print(f"Autonomer Recherche-Agent ({MODEL}) — Text-Modus.")
+    load_config()
     if not ensure_api_key():
         print("Ohne API-Key kann der Agent nicht starten. Beende.")
         return
     print("Arbeitsordner:", WORK_DIR)
-    print("Leere Eingabe oder 'exit' beendet.\n")
+    print("Gesprächsgedächtnis aktiv — Folgefragen bauen aufeinander auf.")
+    print("'neu' startet ein neues Gespräch, leere Eingabe oder 'exit' beendet.\n")
+    agent = Agent()
     while True:
         try:
             request = input("Du > ").strip()
@@ -581,7 +647,11 @@ def main() -> None:
             break
         if not request or request.lower() in {"exit", "quit"}:
             break
-        answer = run_agent(request)
+        if request.lower() in {"neu", "reset"}:
+            agent.reset()
+            print("(neues Gespräch gestartet)\n")
+            continue
+        answer = agent.ask(request)
         print("\nAgent >", answer, "\n")
 
 
