@@ -54,6 +54,8 @@ MAX_FILE_BYTES = 2_000_000        # 2 MB Lese-/Schreib-Obergrenze pro Datei
 MAX_FETCH_BYTES = 3_000_000       # max. Download-Größe einer Seite (roh)
 MAX_FETCH_CHARS = 40_000          # max. an das Modell zurückgegebener Text/Seite
 MAX_SEARCH_RESULTS = 10           # Treffer pro Websuche
+MAX_CONTEXT_CHARS = 200_000       # grober Deckel gegen unbegrenztes Gedächtnis-Wachstum
+MAX_RETRIES = 4                   # SDK-Retries für transiente Fehler (429/5xx)
 
 # Arbeitsordner: alles läuft ausschließlich hier drin. Wird beim Start angelegt.
 _HERE = Path(__file__).resolve().parent
@@ -497,31 +499,83 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
             return client.messages.create(**common)
 
 
+def _finalize(messages: list[dict], text: str) -> tuple[str, list[dict]]:
+    """JEDER Rückgabepfad endet über diese Funktion mit einem assistant-Turn.
+
+    Damit alternieren die Rollen immer sauber (…user, assistant) — auch bei
+    Abbruch (API-Fehler, refusal, Iterationslimit). Sonst würde die Historie auf
+    einem user-Turn enden, die nächste Frage einen zweiten user-Turn anhängen und
+    das Gespräch dauerhaft vergiften. (Fix für den Memory-Bug.)
+    """
+    messages.append({"role": "assistant", "content": text})
+    return text, messages
+
+
+def _msg_size(m: dict) -> int:
+    c = m.get("content")
+    if isinstance(c, str):
+        return len(c)
+    try:
+        return len(json.dumps(c, default=str))
+    except Exception:
+        return len(str(c))
+
+
+def _is_user_question(m: dict) -> bool:
+    """True für einen 'echten' User-Turn (Frage), False für tool_result-Turns.
+    Nur an solchen Grenzen darf die Historie gekürzt werden."""
+    if m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if isinstance(c, list):
+        return not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+    return True
+
+
+def _trim(messages: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> list[dict]:
+    """Begrenzt die Historie, ohne tool_use/tool_result-Paare zu zerreißen.
+
+    Wirft ganze Gesprächsrunden vom Anfang weg (jede Runde beginnt mit einer
+    User-Frage). Die aktuelle (letzte) Runde bleibt immer vollständig erhalten,
+    und das Ergebnis beginnt immer mit einer User-Frage.
+    """
+    if sum(_msg_size(m) for m in messages) <= max_chars:
+        return messages
+    bounds = [i for i, m in enumerate(messages) if _is_user_question(m)]
+    if len(bounds) < 2:
+        return messages  # nur die aktuelle Runde -> nichts sinnvoll wegzuwerfen
+    last_round = bounds[-1]
+    for b in bounds:
+        if b >= last_round:
+            break
+        if sum(_msg_size(m) for m in messages[b:]) <= max_chars:
+            return messages[b:]
+    return messages[last_round:]  # notfalls nur die letzte Runde behalten
+
+
 def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
     """Autonome Kontrollschleife über eine bestehende Nachrichten-Historie.
 
-    Rückgabe: (finale_antwort, aktualisierte_historie). Die Historie enthält
-    danach den vollständigen Verlauf inkl. Tool-Runden und finaler Antwort, sodass
-    Folgefragen daran anknüpfen können.
+    Rückgabe: (finale_antwort, aktualisierte_historie). Über _finalize endet die
+    Historie IMMER auf einem assistant-Turn, sodass Folgefragen sauber anknüpfen.
     """
     for iteration in range(1, MAX_ITERATIONS + 1):
+        messages = _trim(messages)  # Gedächtnis paarungssicher begrenzen
         emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
         try:
             response = _create_message(client, messages)
         except anthropic.APIError as exc:
-            return (f"[Abbruch] API-Fehler: {exc}", messages)
+            return _finalize(messages, f"[Abbruch] API-Fehler: {exc}")
 
         if getattr(response, "model", MODEL) != MODEL:
             emit(f"(Fallback-Modell hat geantwortet: {response.model})")
 
         if response.stop_reason == "refusal":
-            return ("[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.", messages)
+            return _finalize(messages, "[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.")
 
         if response.stop_reason != "tool_use":
             final = "".join(b.text for b in response.content if b.type == "text").strip()
-            final = final or "[Ende] Keine Textantwort erzeugt."
-            messages.append({"role": "assistant", "content": final})
-            return (final, messages)
+            return _finalize(messages, final or "[Ende] Keine Textantwort erzeugt.")
 
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
@@ -536,9 +590,9 @@ def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
                                  "content": result_text, "is_error": is_error})
         messages.append({"role": "user", "content": tool_results})
 
-    return (f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, ohne die "
-            "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen.",
-            messages)
+    return _finalize(messages, f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, "
+                     "ohne die Aufgabe abzuschließen. Bitte die Anfrage konkretisieren "
+                     "oder aufteilen.")
 
 
 def _emitter(verbose: bool, on_step):
@@ -555,7 +609,7 @@ def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
 
     Für ein fortlaufendes Gespräch mit Gedächtnis die Klasse Agent nutzen.
     """
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(max_retries=MAX_RETRIES)
     messages = [{"role": "user", "content": user_request}]
     answer, _ = _run_loop(client, messages, _emitter(verbose, on_step))
     return answer
@@ -569,7 +623,8 @@ class Agent:
     """
 
     def __init__(self):
-        self.client = anthropic.Anthropic()  # liest ANTHROPIC_API_KEY aus der Umgebung
+        # max_retries: transiente 429/5xx werden mehrfach automatisch wiederholt.
+        self.client = anthropic.Anthropic(max_retries=MAX_RETRIES)
         self.messages: list[dict] = []
 
     def ask(self, user_request: str, verbose: bool = True, on_step=None) -> str:

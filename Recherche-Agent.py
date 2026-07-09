@@ -63,6 +63,8 @@ MAX_FILE_BYTES = 2_000_000
 MAX_FETCH_BYTES = 3_000_000
 MAX_FETCH_CHARS = 40_000
 MAX_SEARCH_RESULTS = 10
+MAX_CONTEXT_CHARS = 200_000         # Deckel gegen unbegrenztes Gedächtnis-Wachstum
+MAX_RETRIES = 4                     # SDK-Retries für transiente Fehler (429/5xx)
 
 _HERE = Path(__file__).resolve().parent
 WORK_DIR = Path(os.environ.get("AGENT_WORKDIR", _HERE / "agent_workspace")).resolve()
@@ -384,22 +386,67 @@ def _emitter(verbose, on_step):
     return emit
 
 
+def _finalize(messages: list[dict], text: str) -> tuple[str, list[dict]]:
+    """JEDER Rückgabepfad endet über diese Funktion mit einem assistant-Turn,
+    damit die Rollen immer sauber alternieren — auch bei Abbruch. Sonst würde
+    die Historie auf einem user-Turn enden und die nächste Frage einen zweiten
+    user-Turn anhängen (vergiftetes Gespräch)."""
+    messages.append({"role": "assistant", "content": text})
+    return text, messages
+
+
+def _msg_size(m: dict) -> int:
+    c = m.get("content")
+    if isinstance(c, str):
+        return len(c)
+    try:
+        return len(json.dumps(c, default=str))
+    except Exception:
+        return len(str(c))
+
+
+def _is_user_question(m: dict) -> bool:
+    if m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if isinstance(c, list):
+        return not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+    return True
+
+
+def _trim(messages: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> list[dict]:
+    """Begrenzt die Historie, ohne tool_use/tool_result-Paare zu zerreißen:
+    wirft ganze Runden vom Anfang weg, behält die aktuelle Runde vollständig,
+    Ergebnis beginnt immer mit einer User-Frage."""
+    if sum(_msg_size(m) for m in messages) <= max_chars:
+        return messages
+    bounds = [i for i, m in enumerate(messages) if _is_user_question(m)]
+    if len(bounds) < 2:
+        return messages
+    last_round = bounds[-1]
+    for b in bounds:
+        if b >= last_round:
+            break
+        if sum(_msg_size(m) for m in messages[b:]) <= max_chars:
+            return messages[b:]
+    return messages[last_round:]
+
+
 def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
     for iteration in range(1, MAX_ITERATIONS + 1):
+        messages = _trim(messages)  # Gedächtnis paarungssicher begrenzen
         emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
         try:
             response = _create_message(client, messages)
         except anthropic.APIError as exc:
-            return (f"[Abbruch] API-Fehler: {exc}", messages)
+            return _finalize(messages, f"[Abbruch] API-Fehler: {exc}")
         if getattr(response, "model", MODEL) != MODEL:
             emit(f"(Fallback-Modell hat geantwortet: {response.model})")
         if response.stop_reason == "refusal":
-            return ("[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.", messages)
+            return _finalize(messages, "[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.")
         if response.stop_reason != "tool_use":
             final = "".join(b.text for b in response.content if b.type == "text").strip()
-            final = final or "[Ende] Keine Textantwort erzeugt."
-            messages.append({"role": "assistant", "content": final})
-            return (final, messages)
+            return _finalize(messages, final or "[Ende] Keine Textantwort erzeugt.")
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
         for block in response.content:
@@ -412,13 +459,14 @@ def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
             tool_results.append({"type": "tool_result", "tool_use_id": block.id,
                                  "content": result_text, "is_error": is_error})
         messages.append({"role": "user", "content": tool_results})
-    return (f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, ohne die "
-            "Aufgabe abzuschließen. Bitte die Anfrage konkretisieren oder aufteilen.", messages)
+    return _finalize(messages, f"[Abbruch] Iterationslimit ({MAX_ITERATIONS}) erreicht, "
+                     "ohne die Aufgabe abzuschließen. Bitte die Anfrage konkretisieren "
+                     "oder aufteilen.")
 
 
 def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
     """Einzelanfrage ohne Gedächtnis."""
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(max_retries=MAX_RETRIES)
     answer, _ = _run_loop(client, [{"role": "user", "content": user_request}],
                           _emitter(verbose, on_step))
     return answer
@@ -428,7 +476,7 @@ class Agent:
     """Fortlaufendes Gespräch MIT Gedächtnis."""
 
     def __init__(self):
-        self.client = anthropic.Anthropic()
+        self.client = anthropic.Anthropic(max_retries=MAX_RETRIES)
         self.messages: list[dict] = []
 
     def ask(self, user_request: str, verbose: bool = True, on_step=None) -> str:
