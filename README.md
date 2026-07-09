@@ -114,12 +114,18 @@ Arbeitsordner: standardmäßig `./agent_workspace` (per `AGENT_WORKDIR`
 2. **Kein SSRF** — `fetch_url` erlaubt nur öffentliche http/https-Hosts;
    `localhost`, `127.*`, private Netze (`10.*`, `192.168.*`, `172.16–31.*`),
    Link-Local/Cloud-Metadaten (`169.254.169.254`) und andere Schemata
-   (`file://`, `ftp://`) werden geblockt — alle aufgelösten IPs werden geprüft.
+   (`file://`, `ftp://`) werden geblockt — alle aufgelösten IPs werden geprüft,
+   **und jeder HTTP-Redirect wird erneut geprüft** (kein Umleiten auf interne Ziele).
 3. **Größenlimits** — 2 MB pro Datei, 3 MB Download, 40 000 Zeichen/Seite ans Modell.
 4. **Keine Systembefehle / kein Shell / kein beliebiger Code** — es gibt kein Tool dafür.
 5. **Hartes Iterationslimit** von 15 Runden, danach sauberer Abbruch.
-6. **Kein Crash bei Tool-Fehlern** — jeder Fehler geht als `is_error` zurück ans
+6. **Gedächtnis-Deckel** — die Historie wird auf ~200 000 Zeichen begrenzt
+   (alte Runden fallen weg, älteste Quell-Inhalte werden gekürzt), ohne
+   `tool_use`/`tool_result`-Paare zu zerreißen.
+7. **Kein Crash bei Tool-Fehlern** — jeder Fehler geht als `is_error` zurück ans
    Modell, das dann einen anderen Weg wählen kann.
+8. **Gültige Message-History** — jeder Abbruch (API-Fehler/refusal/Limit) endet
+   sauber, sodass Folgefragen das Gespräch nicht vergiften.
 
 Zusätzlich: bei einer **Sicherheits-Ablehnung** durch Fable 5 übernimmt
 automatisch das Fallback-Modell `claude-opus-4-8` (server-side fallback).

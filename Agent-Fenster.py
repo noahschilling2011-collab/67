@@ -140,6 +140,9 @@ class AgentGUI:
         self.root.after(100, self._drain)
 
     def open_settings(self) -> None:
+        if self.busy:  # Konfig nicht mitten in einem laufenden ask() ändern
+            self._log("Bitte warten, bis die aktuelle Anfrage fertig ist.", "schritt")
+            return
         win = tk.Toplevel(self.root)
         win.title("Einstellungen")
         win.transient(self.root)

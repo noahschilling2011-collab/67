@@ -156,6 +156,20 @@ def _assert_public_url(url: str) -> str:
     return url
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prüft bei JEDEM 30x-Redirect das Sprungziel erneut mit _assert_public_url.
+    Sonst könnte eine öffentliche Seite per 'Location:' auf eine interne Adresse
+    umleiten und den SSRF-Schutz umgehen (urllib folgt Redirects sonst blind)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_url(newurl)  # wirft GuardrailError bei interner Ziel-URL
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Opener, der Redirects nur zu öffentlichen Zielen folgt.
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool 1 — Websuche (liefert Text + URLs zum Nachladen)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,10 +293,12 @@ def tool_fetch_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
         return "[Fetch] Leere URL."
-    _assert_public_url(url)  # Guardrail: kein SSRF
+    _assert_public_url(url)  # Guardrail: kein SSRF (Start-URL)
 
     req = urllib.request.Request(url, headers={"User-Agent": "tool-agent/1.0"})
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    # Über den sicheren Opener: jeder Redirect wird erneut geprüft.
+    with _SAFE_OPENER.open(req, timeout=12) as resp:
+        _assert_public_url(resp.geturl())  # final gelandete URL muss öffentlich sein
         raw = resp.read(MAX_FETCH_BYTES + 1)
         ctype = resp.headers.get("Content-Type", "")
 
@@ -532,25 +548,60 @@ def _is_user_question(m: dict) -> bool:
     return True
 
 
+_TRUNC_MARK = " [gekuerzt]"  # ASCII, damit die Längenrechnung exakt bleibt
+
+
+def _truncate_oldest_tool_results(messages: list[dict], max_chars: int,
+                                  min_keep: int = 800) -> list[dict]:
+    """Kürzt die INHALTE der ältesten tool_result-Blöcke (alt → neu), bis die
+    Historie unter max_chars liegt. Anzahl/Reihenfolge der Turns bleiben
+    unverändert — tool_use/tool_result-Paarung und Rollen-Alternierung bleiben
+    garantiert intakt. Greift auch in einer einzelnen Riesenrunde."""
+    for m in messages:
+        if sum(_msg_size(x) for x in messages) <= max_chars:
+            break
+        if m.get("role") != "user" or not isinstance(m.get("content"), list):
+            continue
+        for b in m["content"]:
+            if sum(_msg_size(x) for x in messages) <= max_chars:
+                break
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and isinstance(b.get("content"), str) and len(b["content"]) > min_keep):
+                over = sum(_msg_size(x) for x in messages) - max_chars
+                c = b["content"]
+                cut = min(over + len(_TRUNC_MARK), len(c) - min_keep)
+                b["content"] = c[:len(c) - cut] + _TRUNC_MARK
+    return messages
+
+
 def _trim(messages: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> list[dict]:
     """Begrenzt die Historie, ohne tool_use/tool_result-Paare zu zerreißen.
 
-    Wirft ganze Gesprächsrunden vom Anfang weg (jede Runde beginnt mit einer
-    User-Frage). Die aktuelle (letzte) Runde bleibt immer vollständig erhalten,
-    und das Ergebnis beginnt immer mit einer User-Frage.
+    Stufe 1: ganze frühere Gesprächsrunden vom Anfang verwerfen (jede Runde
+             beginnt mit einer User-Frage; die aktuelle Runde bleibt ganz).
+    Stufe 2: reicht das nicht (einzelne/riesige aktive Runde oder zustandsloses
+             run_agent mit nur einer Runde), Inhalte der ältesten tool_result-
+             Blöcke kürzen — ohne die Turn-Struktur anzutasten.
+    Das Ergebnis beginnt immer mit einer User-Frage.
     """
     if sum(_msg_size(m) for m in messages) <= max_chars:
         return messages
+
     bounds = [i for i, m in enumerate(messages) if _is_user_question(m)]
-    if len(bounds) < 2:
-        return messages  # nur die aktuelle Runde -> nichts sinnvoll wegzuwerfen
-    last_round = bounds[-1]
-    for b in bounds:
-        if b >= last_round:
-            break
-        if sum(_msg_size(m) for m in messages[b:]) <= max_chars:
-            return messages[b:]
-    return messages[last_round:]  # notfalls nur die letzte Runde behalten
+    if len(bounds) >= 2:  # Stufe 1: so wenige Runden wie möglich verwerfen
+        last_round = bounds[-1]
+        chosen = last_round
+        for b in bounds:
+            if b >= last_round:
+                break
+            if sum(_msg_size(m) for m in messages[b:]) <= max_chars:
+                chosen = b
+                break
+        messages = messages[chosen:]
+
+    if sum(_msg_size(m) for m in messages) > max_chars:  # Stufe 2
+        messages = _truncate_oldest_tool_results(messages, max_chars)
+    return messages
 
 
 def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
@@ -573,15 +624,18 @@ def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
         if response.stop_reason == "refusal":
             return _finalize(messages, "[Abbruch] Anfrage wurde aus Sicherheitsgründen abgelehnt.")
 
-        if response.stop_reason != "tool_use":
+        # Nur echte tool_use-Blöcke lösen eine Tool-Runde aus. Fehlen sie (auch
+        # wenn stop_reason=='tool_use' behauptet), als finale Textantwort behandeln
+        # — sonst entstünde ein leerer user-Turn (content=[]), der die API-History
+        # dauerhaft ungültig macht.
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+        if response.stop_reason != "tool_use" or not tool_uses:
             final = "".join(b.text for b in response.content if b.type == "text").strip()
             return _finalize(messages, final or "[Ende] Keine Textantwort erzeugt.")
 
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for block in tool_uses:
             emit(f"→ Tool: {block.name}  {json.dumps(block.input, ensure_ascii=False)[:160]}")
             result_text, is_error = _execute_tool(block.name, block.input)
             preview = result_text if len(result_text) <= 200 else result_text[:200] + "…"
