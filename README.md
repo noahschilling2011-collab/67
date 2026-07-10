@@ -16,6 +16,9 @@ darauf, sich **viel Information** zu beschaffen: Websuche liefert Quell-URLs,
 - **Linux:** Terminal → `python3 "Agent-Fenster.py"` (ggf. einmalig
   `sudo apt install python3-tk`).
 - Braucht `agent.py` im selben Ordner. Key wird im Fenster abgefragt.
+- **Die Antwort erscheint live** (Wort für Wort), **„Stoppen"** bricht eine
+  laufende Anfrage sauber ab, **„Verlauf speichern"** legt das Gespräch als
+  Textdatei ab, **„Neu"** startet ein frisches Gespräch.
 
 **B) Alles in einer Datei (Konsole) — `Recherche-Agent.py`**
 - **Windows:** doppelklicken. **Mac/Linux:** `python3 "Recherche-Agent.py"`.

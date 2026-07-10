@@ -9,13 +9,18 @@ Start:
   • Linux:   python3 "Agent-Fenster.py"  (ggf. sudo apt install python3-tk)
 
 Braucht agent.py im selben Ordner und das Paket anthropic. Der API-Key wird
-beim ersten Start abgefragt. Gesprächsgedächtnis ist aktiv (Folgefragen bauen
-aufeinander auf) — "Neu" startet ein frisches Gespräch. Über "Einstellungen"
-lassen sich optionale Such-Schlüssel (Tavily/Brave) und die Gründlichkeit setzen.
+beim ersten Start abgefragt.
+
+Neu:
+  • Die Antwort erscheint LIVE Wort für Wort (Streaming).
+  • "Stoppen" bricht eine laufende Anfrage sauber ab.
+  • "Verlauf speichern" schreibt das Gespräch als Textdatei.
+  • Gesprächsgedächtnis; "Neu" startet frisch; "Einstellungen" für Such-Keys.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
 import queue
 import threading
@@ -59,49 +64,93 @@ class AgentGUI:
         self.root = root
         self.q: queue.Queue = queue.Queue()
         self.busy = False
+        self.cancel = False
         self.agent = agent.Agent()  # Gespräch MIT Gedächtnis
 
+        # Zustand für die Live-Antwort-Darstellung
+        self._answer_open = False
+        self._live_answer = ""
+
         root.title(f"Recherche-Agent — {agent.MODEL}")
-        root.geometry("800x600")
+        root.geometry("900x640")
+        root.minsize(560, 400)
 
         # obere Leiste mit Aktions-Buttons
         top = tk.Frame(root)
-        top.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Button(top, text="Neu (Gespräch)", command=self.on_reset).pack(side="left")
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Button(top, text="Neu", width=8, command=self.on_reset).pack(side="left")
+        tk.Button(top, text="Verlauf speichern", command=self.on_save).pack(side="left", padx=(6, 0))
         tk.Button(top, text="Einstellungen", command=self.open_settings).pack(side="left", padx=(6, 0))
-        self.status = tk.Label(top, text="bereit", fg="#777")
+        self.status = tk.Label(top, text="bereit", fg="#2e7d32")
         self.status.pack(side="right")
 
-        self.out = scrolledtext.ScrolledText(root, wrap="word", state="disabled")
-        self.out.pack(fill="both", expand=True, padx=8, pady=(6, 4))
-        self.out.tag_config("du", foreground="#1565c0")
-        self.out.tag_config("agent", foreground="#2e7d32")
-        self.out.tag_config("schritt", foreground="#888888")
+        self.out = scrolledtext.ScrolledText(root, wrap="word", state="disabled",
+                                             font=("TkDefaultFont", 11), padx=6, pady=6)
+        self.out.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        self.out.tag_config("du", foreground="#1565c0", font=("TkDefaultFont", 11, "bold"))
+        self.out.tag_config("agent", foreground="#1b5e20")
+        self.out.tag_config("schritt", foreground="#8a8a8a")
 
         bar = tk.Frame(root)
-        bar.pack(fill="x", padx=8, pady=(0, 8))
+        bar.pack(fill="x", padx=10, pady=(0, 10))
         self.entry = tk.Entry(bar, font=("TkDefaultFont", 12))
-        self.entry.pack(side="left", fill="x", expand=True, ipady=4)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=5)
         self.entry.bind("<Return>", lambda _e: self.on_send())
         self.entry.focus()
         self.btn = tk.Button(bar, text="Senden", width=10, command=self.on_send)
-        self.btn.pack(side="left", padx=(6, 0))
+        self.btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = tk.Button(bar, text="Stoppen", width=9,
+                                  command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6, 0))
 
         self._log(f"Bereit. Frage eingeben und Enter drücken. Folgefragen bauen "
-                  f"aufeinander auf.\nArbeitsordner: {agent.WORK_DIR}", "schritt")
-        self.root.after(100, self._drain)
+                  f"aufeinander auf; die Antwort erscheint live.\n"
+                  f"Arbeitsordner: {agent.WORK_DIR}", "schritt")
+        self.root.after(60, self._drain)
 
-    def _log(self, text: str, tag: str | None = None) -> None:
+    # ---- Ausgabe-Helfer ----
+    def _raw(self, text: str, tag: str | None = None) -> None:
         self.out.configure(state="normal")
-        self.out.insert("end", text + "\n", tag)
+        self.out.insert("end", text, tag)
         self.out.see("end")
         self.out.configure(state="disabled")
 
+    def _log(self, text: str, tag: str | None = None) -> None:
+        self._raw(text + "\n", tag)
+
+    def _begin_answer(self) -> None:
+        self._raw("\nAgent > ", "agent")
+        self._answer_open = True
+        self._live_answer = ""
+
+    def _close_answer(self) -> None:
+        if self._answer_open:
+            self._raw("\n")
+            self._answer_open = False
+
+    # ---- Aktionen ----
     def on_reset(self) -> None:
         if self.busy:
             return
         self.agent.reset()
         self._log("\n— neues Gespräch —", "schritt")
+
+    def on_save(self) -> None:
+        text = self.out.get("1.0", "end").strip()
+        if not text:
+            return
+        name = "verlauf_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt"
+        path = agent.WORK_DIR / name
+        try:
+            path.write_text(text, encoding="utf-8")
+            self._log(f"Verlauf gespeichert: {path}", "schritt")
+        except OSError as exc:
+            self._log(f"Konnte Verlauf nicht speichern: {exc}", "schritt")
+
+    def on_stop(self) -> None:
+        if self.busy:
+            self.cancel = True
+            self.status.configure(text="wird gestoppt …", fg="#b26a00")
 
     def on_send(self) -> None:
         if self.busy:
@@ -112,35 +161,57 @@ class AgentGUI:
         self.entry.delete(0, "end")
         self._log("\nDu > " + req, "du")
         self.busy = True
+        self.cancel = False
         self.btn.configure(state="disabled", text="…")
-        self.status.configure(text="arbeitet …")
+        self.stop_btn.configure(state="normal")
+        self.status.configure(text="arbeitet …", fg="#b26a00")
         threading.Thread(target=self._work, args=(req,), daemon=True).start()
 
     def _work(self, req: str) -> None:
         try:
-            answer = self.agent.ask(req, verbose=False, on_step=self.q.put)
+            answer = self.agent.ask(
+                req, verbose=False,
+                on_step=lambda s: self.q.put(("step", s)),
+                on_delta=lambda t: self.q.put(("delta", t)),
+                should_cancel=lambda: self.cancel,
+            )
         except Exception as exc:  # nichts soll das Fenster abstürzen lassen
             answer = f"[Fehler] {type(exc).__name__}: {exc}"
-        self.q.put(("__DONE__", answer))
+        self.q.put(("done", answer))
 
     def _drain(self) -> None:
         try:
             while True:
-                item = self.q.get_nowait()
-                if isinstance(item, tuple) and item and item[0] == "__DONE__":
-                    self._log("\nAgent > " + item[1], "agent")
-                    self.busy = False
-                    self.btn.configure(state="normal", text="Senden")
-                    self.status.configure(text="bereit")
-                    self.entry.focus()
-                else:
-                    self._log("   " + str(item), "schritt")
+                kind, payload = self.q.get_nowait()
+                if kind == "step":
+                    self._close_answer()
+                    self._log("   " + payload, "schritt")
+                elif kind == "delta":
+                    if not self._answer_open:
+                        self._begin_answer()
+                    self._raw(payload, "agent")
+                    self._live_answer += payload
+                elif kind == "done":
+                    self._finish(payload)
         except queue.Empty:
             pass
-        self.root.after(100, self._drain)
+        self.root.after(60, self._drain)
+
+    def _finish(self, answer: str) -> None:
+        # Wurde die Antwort bereits live gestreamt? Dann nicht doppelt ausgeben.
+        already = self._answer_open and answer.strip() == self._live_answer.strip()
+        self._close_answer()
+        if not already:
+            self._log("\nAgent > " + answer, "agent")
+        self.busy = False
+        self.cancel = False
+        self.btn.configure(state="normal", text="Senden")
+        self.stop_btn.configure(state="disabled")
+        self.status.configure(text="bereit", fg="#2e7d32")
+        self.entry.focus()
 
     def open_settings(self) -> None:
-        if self.busy:  # Konfig nicht mitten in einem laufenden ask() ändern
+        if self.busy:
             self._log("Bitte warten, bis die aktuelle Anfrage fertig ist.", "schritt")
             return
         win = tk.Toplevel(self.root)

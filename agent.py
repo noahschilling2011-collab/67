@@ -515,6 +515,34 @@ def _create_message(client: "anthropic.Anthropic", messages: list[dict]):
             return client.messages.create(**common)
 
 
+def _stream_message(client, messages: list[dict], on_delta):
+    """Wie _create_message, aber gestreamt: ruft on_delta(text) für jedes Text-
+    Delta auf und gibt am Ende die komplette Nachricht zurück. Kann die SDK-Version
+    nicht streamen, wird transparent auf _create_message (nicht-gestreamt)
+    zurückgefallen — der Aufrufer merkt außer fehlenden Live-Deltas nichts."""
+    common = dict(
+        model=MODEL, max_tokens=MAX_TOKENS, system=_system_prompt(),
+        tools=TOOLS_SCHEMA, messages=messages, output_config={"effort": EFFORT},
+    )
+    openers = (
+        lambda: client.beta.messages.stream(
+            betas=["server-side-fallback-2026-06-01"],
+            fallbacks=[{"model": FALLBACK_MODEL}], **common),
+        lambda: client.messages.stream(**common),
+    )
+    for opener in openers:
+        try:
+            with opener() as stream:
+                for text in stream.text_stream:
+                    if text:
+                        on_delta(text)
+                return stream.get_final_message()
+        except (TypeError, AttributeError, anthropic.BadRequestError):
+            continue  # diese SDK-Variante kennt die Parameter/Methode nicht
+        # anthropic.APIError propagiert nach oben (echter Fehler, kein Fallback hier)
+    return _create_message(client, messages)  # Streaming nicht verfügbar
+
+
 def _finalize(messages: list[dict], text: str) -> tuple[str, list[dict]]:
     """JEDER Rückgabepfad endet über diese Funktion mit einem assistant-Turn.
 
@@ -604,17 +632,28 @@ def _trim(messages: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> list[dict
     return messages
 
 
-def _run_loop(client, messages: list[dict], emit) -> tuple[str, list[dict]]:
+def _run_loop(client, messages: list[dict], emit, on_delta=None,
+              should_cancel=None) -> tuple[str, list[dict]]:
     """Autonome Kontrollschleife über eine bestehende Nachrichten-Historie.
 
     Rückgabe: (finale_antwort, aktualisierte_historie). Über _finalize endet die
     Historie IMMER auf einem assistant-Turn, sodass Folgefragen sauber anknüpfen.
+
+    on_delta:      optionaler Callback(text) — ist er gesetzt, wird die Antwort
+                   gestreamt und jedes Text-Delta durchgereicht (Live-Ausgabe).
+    should_cancel: optionaler Callback() -> bool — wird vor jeder Iteration
+                   geprüft; bei True sauberer Abbruch (History bleibt gültig).
     """
     for iteration in range(1, MAX_ITERATIONS + 1):
+        if should_cancel is not None and should_cancel():
+            return _finalize(messages, "[Abgebrochen] Auf Wunsch gestoppt.")
         messages = _trim(messages)  # Gedächtnis paarungssicher begrenzen
         emit(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
         try:
-            response = _create_message(client, messages)
+            if on_delta is not None:
+                response = _stream_message(client, messages, on_delta)
+            else:
+                response = _create_message(client, messages)
         except anthropic.APIError as exc:
             return _finalize(messages, f"[Abbruch] API-Fehler: {exc}")
 
@@ -658,14 +697,16 @@ def _emitter(verbose: bool, on_step):
     return emit
 
 
-def run_agent(user_request: str, verbose: bool = True, on_step=None) -> str:
+def run_agent(user_request: str, verbose: bool = True, on_step=None,
+              on_delta=None, should_cancel=None) -> str:
     """Einzelanfrage ohne Gedächtnis (Rückgabe: finale Textantwort).
 
     Für ein fortlaufendes Gespräch mit Gedächtnis die Klasse Agent nutzen.
     """
     client = anthropic.Anthropic(max_retries=MAX_RETRIES)
     messages = [{"role": "user", "content": user_request}]
-    answer, _ = _run_loop(client, messages, _emitter(verbose, on_step))
+    answer, _ = _run_loop(client, messages, _emitter(verbose, on_step),
+                          on_delta=on_delta, should_cancel=should_cancel)
     return answer
 
 
@@ -681,10 +722,12 @@ class Agent:
         self.client = anthropic.Anthropic(max_retries=MAX_RETRIES)
         self.messages: list[dict] = []
 
-    def ask(self, user_request: str, verbose: bool = True, on_step=None) -> str:
+    def ask(self, user_request: str, verbose: bool = True, on_step=None,
+            on_delta=None, should_cancel=None) -> str:
         self.messages.append({"role": "user", "content": user_request})
-        answer, self.messages = _run_loop(self.client, self.messages,
-                                          _emitter(verbose, on_step))
+        answer, self.messages = _run_loop(
+            self.client, self.messages, _emitter(verbose, on_step),
+            on_delta=on_delta, should_cancel=should_cancel)
         return answer
 
     def reset(self) -> None:
